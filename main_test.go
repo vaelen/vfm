@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestFmtSize(t *testing.T) {
@@ -23,13 +24,14 @@ func TestFmtSize(t *testing.T) {
 
 func TestOrder(t *testing.T) {
 	items := []*item{
-		{name: "small", state: sized, size: 10},
-		{name: "b", state: sizing},
-		{name: "big", state: sized, size: 1000},
-		{name: "a", state: queued},
+		{name: "small", state: sized, size: 10, mtime: time.Unix(300, 0)},
+		{name: "b", state: sizing, mtime: time.Unix(100, 0)},
+		{name: "big", state: sized, size: 1000, mtime: time.Unix(200, 0)},
+		{name: "a", state: queued, mtime: time.Unix(200, 0)},
 	}
 	for mode, want := range map[int]string{
 		byLargest: "big small a b ", bySmallest: "small big a b ",
+		byNewest: "small a big b ", byOldest: "b a big small ",
 		byNameAsc: "a b big small ", byNameDesc: "small big b a ",
 	} {
 		sort.Slice(items, func(i, j int) bool { return less(items[i], items[j], mode) })

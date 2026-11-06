@@ -203,7 +203,8 @@ type item struct {
 	state     int
 	size      int64
 	partial   bool
-	meta      *meta // loaded lazily by metaOf for the details view
+	mtime     time.Time // modification time (of the link itself, for symlinks)
+	meta      *meta     // loaded lazily by metaOf for the details view
 }
 
 // ---------- details view metadata ----------
@@ -279,11 +280,13 @@ var detailDropOrder = []string{"Created", "Group", "Owner", "Permissions", "Modi
 const (
 	byLargest = iota
 	bySmallest
+	byNewest
+	byOldest
 	byNameAsc
 	byNameDesc
 )
 
-var sortNames = []string{"largest", "smallest", "name A→Z", "name Z→A"}
+var sortNames = []string{"largest", "smallest", "newest", "oldest", "name A→Z", "name Z→A"}
 
 // less orders items for a sort mode. Size sorts put unsized items at the bottom by name.
 func less(a, b *item, mode int) bool {
@@ -292,6 +295,11 @@ func less(a, b *item, mode int) bool {
 		return a.name < b.name
 	case byNameDesc:
 		return a.name > b.name
+	case byNewest, byOldest:
+		if !a.mtime.Equal(b.mtime) {
+			return a.mtime.After(b.mtime) == (mode == byNewest)
+		}
+		return a.name < b.name
 	}
 	if (a.state == sized) != (b.state == sized) {
 		return a.state == sized
@@ -738,6 +746,9 @@ func (m *model) open(dir, sel string) tea.Cmd {
 	var todo []string
 	for _, e := range ents {
 		it := &item{name: e.Name(), dir: e.IsDir(), link: e.Type()&fs.ModeSymlink != 0}
+		if fi, err := e.Info(); err == nil {
+			it.mtime = fi.ModTime()
+		}
 		if r, ok := m.cache[filepath.Join(dir, it.name)]; ok {
 			it.state, it.size, it.partial = sized, r.size, r.partial
 		} else {

@@ -41,7 +41,7 @@ options.
 | `g`             | Go to a path (`~`, relative and absolute paths work)       |
 | `f`             | Filter the contents by a glob pattern (e.g. `*.mp4`)       |
 | `a`             | Show all entries (clear the filter)                        |
-| `s`             | Cycle sort order: largest, smallest, name A→Z, name Z→A    |
+| `s`             | Cycle sort order: by size, modified date, or name          |
 | `v`             | Switch between the grid and details views                  |
 | `r`             | Refresh sizes for the current directory                    |
 | `m`             | Move or rename the selected entry (like `mv`)              |
