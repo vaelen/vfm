@@ -345,9 +345,10 @@ type model struct {
 	free       int64                 // bytes available on dir's volume (like df "Avail"); -1 if unknown
 	freePct    float64               // free as a percentage of the volume's size
 
-	view int // gridView or detailsView
-	roff int // details view scroll offset (rows)
-	help bool
+	lastCmd string // last ! command, pre-filled next time
+	view    int    // gridView or detailsView
+	roff    int    // details view scroll offset (rows)
+	help    bool
 
 	viewer *viewer // full-screen file viewer, when open
 
@@ -422,9 +423,11 @@ func (m *model) metaOf(it *item) *meta {
 	return it.meta
 }
 
-// pausedCmd runs args in dir, then waits for Enter so the output stays visible.
+// pausedCmd runs args in dir, then waits for a key press so the output stays visible.
 func pausedCmd(dir string, args ...string) *exec.Cmd {
-	script := `"$@"; s=$?; printf '\n[exit %d] Press Enter to return to vfm ' "$s"; read _`
+	// Wait for a single key: non-canonical mode, read one byte, restore the terminal settings.
+	script := `"$@"; s=$?; printf '\n[exit %d] Press any key to return to vfm ' "$s"
+old=$(stty -g); stty -icanon -echo; dd bs=1 count=1 >/dev/null 2>&1; stty "$old"`
 	c := exec.Command("sh", append([]string{"-c", script, "sh"}, args...)...)
 	c.Dir = dir
 	return c
@@ -821,6 +824,16 @@ func (m *model) submit(kind, v string) tea.Cmd {
 		return m.open(p, "")
 	case "move", "copy":
 		return m.transfer(kind, m.promptSrc, v)
+	case "shell":
+		if v == "" {
+			return nil
+		}
+		m.lastCmd = v
+		sh := os.Getenv("SHELL")
+		if sh == "" {
+			sh = "/bin/sh"
+		}
+		return m.run(pausedCmd(m.dir, sh, "-c", v), m.dir) // forgetting m.dir refreshes it afterwards
 	}
 	return nil
 }
@@ -913,6 +926,7 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 		}
 		if msg.forget != "" {
 			m.forget(msg.forget)
+			m.reloadNode(msg.forget) // no-op unless it's a directory in the tree
 		}
 		return m.reopen(m.dir)
 	case tea.KeyMsg:
@@ -1010,6 +1024,8 @@ func (m *model) key(k string) tea.Cmd {
 		}
 		m.openViewer(path, true)
 		return nil
+	case "!":
+		return m.ask("shell", "Run shell command", m.lastCmd)
 	case "x":
 		if path := m.selected(); path != "" {
 			m.confirmExec(path)
@@ -1413,6 +1429,7 @@ var helpKeys = [][2]string{
 	{"e", "Edit in $EDITOR"},
 	{"h", "View file as hex"},
 	{"x", "Execute (asks first)"},
+	{"!", "Run a shell command"},
 	{"?", "This help"},
 	{"q", "Quit"},
 }
@@ -1436,6 +1453,8 @@ func (m *model) promptDialog() string {
 		hint = "e.g. *.mp4 or *log*   (empty shows all)"
 	case "move", "copy":
 		hint = "Into an existing directory, or a new name. ~ and relative paths work"
+	case "shell":
+		hint = "Runs in the current directory with $SHELL; the list refreshes after"
 	}
 	return dialog("12", m.promptTitle, m.input.View()+"\n\n"+dimStyle.Render(hint)+"\n"+
 		warnStyle.Render("[enter]")+" OK      "+warnStyle.Render("[esc]")+" Cancel")

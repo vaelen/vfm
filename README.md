@@ -50,6 +50,7 @@ options.
 | `e`             | Edit the selected file in `$EDITOR`                        |
 | `h`             | View the selected file as hex                              |
 | `x`             | Run the selected executable (asks first)                   |
+| `!`             | Run a shell command in the current directory               |
 | `?`             | Show the list of commands                                  |
 | `q`             | Quit                                                       |
 
@@ -74,7 +75,8 @@ parent.
   Up to 4 MiB of a file is shown (1 MiB as hex). Press `q` or `Esc` to close.
 - `x` shows the program's real location (following symlinks) and asks before
   running it. The program and the editor take over the terminal; after a
-  program exits, vfm waits for Enter before returning.
+  program or `!` command exits, vfm waits for a key press before returning.
+  After `!`, the current directory is re-read and re-sized.
 - The details view drops the Created, Group, Owner, Permissions and Modified
   columns, in that order, when the pane is too narrow.
 - Glob patterns are case-sensitive and use Go's
