@@ -77,6 +77,16 @@ func diskUsage(ctx context.Context, path string) (size int64, partial bool) {
 	return size, partial
 }
 
+// diskFree reports the space available to unprivileged users on path's volume and its share of
+// the volume's size. Refreshed whenever a directory is (re)opened, including after file operations.
+func diskFree(path string) (int64, float64) {
+	var st unix.Statfs_t
+	if unix.Statfs(path, &st) != nil || st.Blocks == 0 {
+		return -1, 0
+	}
+	return int64(st.Bavail) * st.Bsize, float64(st.Bavail) / float64(st.Blocks) * 100
+}
+
 var program *tea.Program // set in main; sizing workers report through it
 
 type sizingMsg struct {
@@ -332,6 +342,8 @@ type model struct {
 	gen        int
 	cancel     context.CancelFunc
 	cache      map[string]sizeResult // full path → size; cleared by refresh/delete via forget
+	free       int64                 // bytes available on dir's volume (like df "Avail"); -1 if unknown
+	freePct    float64               // free as a percentage of the volume's size
 
 	view int // gridView or detailsView
 	roff int // details view scroll offset (rows)
@@ -718,6 +730,7 @@ func (m *model) open(dir, sel string) tea.Cmd {
 	ctx, cancel := context.WithCancel(context.Background())
 	m.gen++
 	m.cancel, m.dir, m.dirty, m.pinned = cancel, dir, false, false
+	m.free, m.freePct = diskFree(dir)
 	m.all, m.byName = make([]*item, 0, len(ents)), make(map[string]*item, len(ents))
 	var todo []string
 	for _, e := range ents {
@@ -1450,7 +1463,12 @@ func (m *model) statusBar() string {
 			total += it.size
 		}
 	}
-	right, st := fmt.Sprintf("sort: %s   %d/%d sized   total %s ", sortNames[m.sortMode], done, len(m.items), strings.TrimSpace(fmtSize(total))), barStyle
+	free := ""
+	if m.free >= 0 {
+		free = fmt.Sprintf("   free %s (%.0f%%)", strings.TrimSpace(fmtSize(m.free)), m.freePct)
+	}
+	right, st := fmt.Sprintf("sort: %s   %d/%d sized   total %s%s ", sortNames[m.sortMode], done, len(m.items),
+		strings.TrimSpace(fmtSize(total)), free), barStyle
 	if m.busy != "" {
 		right = m.spin.View() + " " + clean(m.busy) + " "
 	}

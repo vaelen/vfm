@@ -60,6 +60,8 @@ parent.
 
 - Sizes are disk usage (allocated blocks), the same as `du`, not apparent
   file length. Symlinks are not followed.
+- The status bar shows the free space on the current volume, like `df`'s
+  "Avail" column, and what percentage of the volume that is.
 - A size shown in yellow is a lower bound: some paths inside could not be read.
 - Hidden files are shown.
 - Files with several hard links are counted once per link (`du` counts them once).
