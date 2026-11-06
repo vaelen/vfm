@@ -9,12 +9,16 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/spinner"
@@ -22,6 +26,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"golang.org/x/sys/unix"
 )
 
 // ---------- sizes ----------
@@ -182,7 +187,78 @@ type item struct {
 	state     int
 	size      int64
 	partial   bool
+	meta      *meta // loaded lazily by metaOf for the details view
 }
+
+// ---------- details view metadata ----------
+
+type meta struct {
+	mode         fs.FileMode
+	owner, group string
+	mtime, btime time.Time
+}
+
+var idNames = map[string]string{} // "u1000"/"g1000" → name; only touched on the UI goroutine
+
+func idName(kind byte, id uint32) string {
+	key := string(kind) + strconv.FormatUint(uint64(id), 10)
+	if n, ok := idNames[key]; ok {
+		return n
+	}
+	n := key[1:]
+	if kind == 'u' {
+		if u, err := user.LookupId(n); err == nil {
+			n = u.Username
+		}
+	} else if g, err := user.LookupGroupId(n); err == nil {
+		n = g.Name
+	}
+	idNames[key] = n
+	return n
+}
+
+func loadMeta(path string) *meta {
+	x := &meta{}
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return x
+	}
+	x.mode, x.mtime = fi.Mode(), fi.ModTime()
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		x.owner, x.group = idName('u', st.Uid), idName('g', st.Gid)
+	}
+	// Creation (birth) time needs statx; filesystems that don't record it leave it zero.
+	var sx unix.Statx_t
+	if unix.Statx(unix.AT_FDCWD, path, unix.AT_SYMLINK_NOFOLLOW, unix.STATX_BTIME, &sx) == nil && sx.Mask&unix.STATX_BTIME != 0 {
+		x.btime = time.Unix(sx.Btime.Sec, int64(sx.Btime.Nsec))
+	}
+	return x
+}
+
+func fmtTime(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	return t.Format("2006-01-02 15:04")
+}
+
+type detailCol struct {
+	title string
+	w     int
+	val   func(*meta) string
+}
+
+// Columns between Size and Name, in display order.
+var detailCols = []detailCol{
+	{"Permissions", 11, func(x *meta) string { return x.mode.String() }},
+	{"Owner", 8, func(x *meta) string { return x.owner }},
+	{"Group", 8, func(x *meta) string { return x.group }},
+	{"Modified", 16, func(x *meta) string { return fmtTime(x.mtime) }},
+	{"Created", 16, func(x *meta) string { return fmtTime(x.btime) }},
+}
+
+// Columns dropped first when the pane is too narrow.
+var detailDropOrder = []string{"Created", "Group", "Owner", "Permissions", "Modified"}
 
 const (
 	byLargest = iota
@@ -251,19 +327,137 @@ type model struct {
 	cancel     context.CancelFunc
 	cache      map[string]sizeResult // full path → size; cleared by refresh/delete via forget
 
-	confirm, confirmDesc string // path awaiting delete approval, and its description
-	busy                 string // long-running operation shown in the status bar
+	view int // gridView or detailsView
+	roff int // details view scroll offset (rows)
+	help bool
 
-	prompt, promptTitle string // open input dialog ("filter" or "goto") and its title
-	input               textinput.Model
+	confirm *confirmation // yes/no dialog awaiting an answer
+	busy    string        // long-running operation shown in the status bar
+
+	prompt, promptTitle, promptSrc string // open input dialog kind, its title, and the path it acts on
+	input                          textinput.Model
 
 	spin spinner.Model
 	err  string
 }
 
+const (
+	gridView = iota
+	detailsView
+)
+
+// confirmation is a yes/no dialog; run is started (with busy shown) only on "y".
+type confirmation struct {
+	title, path, desc, yes, busy string
+	run                          tea.Cmd
+}
+
 type deletedMsg struct {
 	path string
 	err  error
+}
+
+// opDoneMsg reports a finished mv/cp of src to dst (the final path).
+type opDoneMsg struct {
+	src, dst string
+	move     bool
+	out      string
+	err      error
+}
+
+// execDoneMsg reports return from a suspended external program; forget is a path whose size may have changed.
+type execDoneMsg struct {
+	err    error
+	forget string
+}
+
+// under reports whether path is dir or inside it.
+func under(path, dir string) bool { return path == dir || strings.HasPrefix(path, dir+"/") }
+
+// reload re-reads a tree node's subdirectories, keeping existing child nodes (and their expansion).
+func (n *node) reload() {
+	old := map[string]*node{}
+	for _, k := range n.kids {
+		old[k.name] = k
+	}
+	n.loaded, n.kids = false, nil
+	n.load()
+	for i, k := range n.kids {
+		if o, ok := old[k.name]; ok {
+			n.kids[i] = o
+		}
+	}
+}
+
+func (m *model) reloadNode(path string) {
+	if n := m.walkTo(path, false); n.path == path {
+		n.reload()
+	}
+}
+
+func (m *model) metaOf(it *item) *meta {
+	if it.meta == nil {
+		it.meta = loadMeta(filepath.Join(m.dir, it.name))
+	}
+	return it.meta
+}
+
+// pausedCmd runs args in dir, then waits for Enter so the output stays visible.
+func pausedCmd(dir string, args ...string) *exec.Cmd {
+	script := `"$@"; s=$?; printf '\n[exit %d] Press Enter to return to vfm ' "$s"; read _`
+	c := exec.Command("sh", append([]string{"-c", script, "sh"}, args...)...)
+	c.Dir = dir
+	return c
+}
+
+// run suspends the TUI and runs c in the terminal.
+func (m *model) run(c *exec.Cmd, forget string) tea.Cmd {
+	return tea.ExecProcess(c, func(err error) tea.Msg { return execDoneMsg{err, forget} })
+}
+
+// activate handles Enter on a path: open directories (including symlinked ones), run executables.
+func (m *model) activate(path string) tea.Cmd {
+	fi, err := os.Stat(path)
+	switch {
+	case err != nil:
+		m.err = err.Error()
+	case fi.IsDir():
+		return m.open(path, "")
+	case fi.Mode().IsRegular() && fi.Mode()&0o111 != 0:
+		return m.run(pausedCmd(m.dir, path), "")
+	}
+	return nil
+}
+
+// transfer runs mv or cp -R from src to the user's destination, confirming before overwriting.
+func (m *model) transfer(kind, src, v string) tea.Cmd {
+	if v == "" {
+		return nil
+	}
+	dst := expandPath(v, m.dir)
+	target := dst // the path src will end up at
+	if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
+		target = filepath.Join(dst, filepath.Base(src))
+	}
+	if target == src {
+		m.err = "source and destination are the same"
+		return nil
+	}
+	name, args, verb := "mv", []string{"--", src, dst}, "Moving"
+	if kind == "copy" {
+		name, args, verb = "cp", []string{"-R", "--", src, dst}, "Copying"
+	}
+	run := func() tea.Msg {
+		out, err := exec.Command(name, args...).CombinedOutput()
+		return opDoneMsg{src, target, kind == "move", string(out), err}
+	}
+	busy := verb + " " + src + "…"
+	if _, err := os.Lstat(target); err == nil {
+		m.confirm = &confirmation{title: "Overwrite?", path: target, desc: "already exists", yes: "Overwrite", busy: busy, run: run}
+		return nil
+	}
+	m.busy = busy
+	return run
 }
 
 // forget drops cached sizes for path, everything under it, and its ancestors (whose totals include it).
@@ -424,7 +618,7 @@ func (m *model) resort() {
 
 // ask opens an input dialog of the given kind.
 func (m *model) ask(kind, title, value string) tea.Cmd {
-	m.prompt, m.promptTitle = kind, title
+	m.prompt, m.promptTitle, m.promptSrc = kind, title, m.selected()
 	m.input.Width = max(10, min(60, m.w-16))
 	m.input.SetValue(value)
 	m.input.CursorEnd()
@@ -469,6 +663,8 @@ func (m *model) submit(kind, v string) tea.Cmd {
 			return m.open(filepath.Dir(p), filepath.Base(p)) // a file: open its directory with it selected
 		}
 		return m.open(p, "")
+	case "move", "copy":
+		return m.transfer(kind, m.promptSrc, v)
 	}
 	return nil
 }
@@ -530,10 +726,36 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 		}
 		m.forget(msg.path)
 		dir := m.dir
-		if dir == msg.path || strings.HasPrefix(dir, msg.path+"/") {
+		if under(dir, msg.path) {
 			dir = filepath.Dir(msg.path)
 		}
 		return m.reopen(dir)
+	case opDoneMsg:
+		m.busy = ""
+		if msg.err != nil {
+			if m.err = strings.TrimSpace(msg.out); m.err == "" {
+				m.err = msg.err.Error()
+			}
+		}
+		dir := m.dir
+		if msg.move {
+			m.forget(msg.src)
+			m.reloadNode(filepath.Dir(msg.src))
+			if under(dir, msg.src) {
+				dir = filepath.Dir(msg.src)
+			}
+		}
+		m.forget(msg.dst)
+		m.reloadNode(filepath.Dir(msg.dst))
+		return m.reopen(dir)
+	case execDoneMsg:
+		if msg.err != nil {
+			m.err = msg.err.Error()
+		}
+		if msg.forget != "" {
+			m.forget(msg.forget)
+		}
+		return m.reopen(m.dir)
 	case tea.KeyMsg:
 		m.err = ""
 		if m.prompt != "" && msg.String() != "ctrl+c" {
@@ -548,23 +770,30 @@ func (m *model) key(k string) tea.Cmd {
 	if k == "ctrl+c" {
 		return tea.Quit
 	}
-	if path := m.confirm; path != "" {
-		m.confirm = ""
+	if m.help {
+		m.help = false // any key closes help
+		return nil
+	}
+	if c := m.confirm; c != nil {
+		m.confirm = nil
 		if k != "y" && k != "Y" {
 			return nil // anything but y cancels
 		}
-		m.busy = "Deleting " + path + "…"
-		return func() tea.Msg { return deletedMsg{path, os.RemoveAll(path)} }
+		m.busy = c.busy
+		return c.run
 	}
 	switch k {
 	case "q":
 		return tea.Quit
+	case "?":
+		m.help = true
+		return nil
+	case "v":
+		m.view ^= 1
+		return nil
 	case "r":
 		m.forget(m.dir)
-		if n := m.walkTo(m.dir, false); n.path == m.dir {
-			n.loaded, n.kids = false, nil
-			n.load()
-		}
+		m.reloadNode(m.dir)
 		return m.reopen(m.dir)
 	case "d":
 		path := m.selected()
@@ -576,14 +805,48 @@ func (m *model) key(k string) tea.Cmd {
 			m.err = err.Error()
 			return nil
 		}
-		m.confirm, m.confirmDesc = path, "file"
+		desc := "file"
 		if fi.IsDir() {
-			m.confirmDesc = "directory and everything in it"
+			desc = "directory and everything in it"
 		}
 		if r, ok := m.cache[path]; ok {
-			m.confirmDesc += ", " + strings.TrimSpace(fmtSize(r.size))
+			desc += ", " + strings.TrimSpace(fmtSize(r.size))
 		}
+		m.confirm = &confirmation{title: "Delete permanently?", path: path, desc: desc, yes: "Delete",
+			busy: "Deleting " + path + "…", run: func() tea.Msg { return deletedMsg{path, os.RemoveAll(path)} }}
 		return nil
+	case "m", "c":
+		path := m.selected()
+		if path == "" || path == "/" || m.busy != "" {
+			return nil
+		}
+		name := filepath.Base(path)
+		if clean(name) != name {
+			name = "" // don't echo control characters into the input
+		}
+		if k == "m" {
+			return m.ask("move", "Move / rename to", name)
+		}
+		return m.ask("copy", "Copy to", name)
+	case "e":
+		path := m.selected()
+		if path == "" {
+			return nil
+		}
+		ed := strings.Fields(os.Getenv("EDITOR"))
+		if len(ed) == 0 {
+			ed = []string{"vi"}
+		}
+		c := exec.Command(ed[0], append(ed[1:], path)...)
+		c.Dir = m.dir
+		return m.run(c, path)
+	case "h":
+		path := m.selected()
+		if fi, err := os.Stat(path); err != nil || fi.IsDir() {
+			m.err = "not a file: " + path
+			return nil
+		}
+		return m.run(pausedCmd(m.dir, "xxd", path), "")
 	case "f":
 		return m.ask("filter", "Filter by glob pattern", m.filter)
 	case "a":
@@ -656,7 +919,10 @@ func (m *model) contentKey(k string) tea.Cmd {
 	case "down":
 		m.ccur = min(n-1, m.ccur+1)
 	case "pgup", "pgdown":
-		page := m.visibleCols(m.colWidths()) * rows
+		page := m.innerH() - 1 // details: one screen of rows below the header
+		if m.view == gridView {
+			page = m.visibleCols(m.colWidths()) * rows
+		}
 		if k == "pgup" {
 			m.ccur = max(0, m.ccur-page)
 		} else {
@@ -667,16 +933,16 @@ func (m *model) contentKey(k string) tea.Cmd {
 	case "end":
 		m.ccur = n - 1
 	case "left":
-		if m.ccur >= rows {
+		if m.view == gridView && m.ccur >= rows {
 			m.ccur -= rows
 		}
 	case "right":
-		if m.ccur/rows < (n-1)/rows {
+		if m.view == gridView && m.ccur/rows < (n-1)/rows {
 			m.ccur = min(n-1, m.ccur+rows)
 		}
 	case "enter":
-		if m.ccur < n && m.items[m.ccur].dir {
-			return m.open(filepath.Join(m.dir, m.items[m.ccur].name), "")
+		if m.ccur < n {
+			return m.activate(filepath.Join(m.dir, m.items[m.ccur].name))
 		}
 	}
 	return nil
@@ -708,6 +974,17 @@ func (m *model) clamp() {
 	}
 
 	m.ccur = max(0, min(m.ccur, len(m.items)-1))
+	if m.view == detailsView {
+		page := max(1, h-1)
+		m.roff = max(0, min(m.roff, len(m.items)-page))
+		if m.ccur < m.roff {
+			m.roff = m.ccur
+		}
+		if m.ccur >= m.roff+page {
+			m.roff = m.ccur - page + 1
+		}
+		return
+	}
 	ws := m.colWidths()
 	col := m.ccur / h
 	m.coff = max(0, min(m.coff, len(ws)-1))
@@ -738,6 +1015,7 @@ var (
 	curDimStyle = lipgloss.NewStyle().Background(lipgloss.Color("238"))
 	barStyle    = lipgloss.NewStyle().Reverse(true)
 	errBarStyle = lipgloss.NewStyle().Background(lipgloss.Color("1")).Foreground(lipgloss.Color("15"))
+	headerStyle = lipgloss.NewStyle().Bold(true).Underline(true)
 )
 
 // clean replaces control characters in s with '?' so names from the filesystem can't inject
@@ -809,28 +1087,81 @@ func (m *model) treeLine(r treeRow, cur bool, w int) string {
 	return text
 }
 
-func (m *model) itemCell(it *item, w int, cur bool) string {
-	sz, st := strings.Repeat(" ", sizeW), dimStyle
+// sizeField is the fixed-width size text for it (a spinner while sizing) and its style.
+func (m *model) sizeField(it *item) (string, lipgloss.Style) {
 	switch it.state {
 	case sizing:
-		sz = strings.Repeat(" ", sizeW-1) + m.spin.View()
+		return strings.Repeat(" ", sizeW-1) + m.spin.View(), dimStyle
 	case sized:
-		sz, st = fmtSize(it.size), plainStyle
 		if it.partial {
-			st = warnStyle // some paths were unreadable; size is a lower bound
+			return fmtSize(it.size), warnStyle // some paths were unreadable; size is a lower bound
 		}
+		return fmtSize(it.size), plainStyle
 	}
+	return strings.Repeat(" ", sizeW), dimStyle
+}
+
+func nameStyle(it *item) lipgloss.Style {
+	switch {
+	case it.dir:
+		return dirStyle
+	case it.link:
+		return linkStyle
+	}
+	return plainStyle
+}
+
+func (m *model) itemCell(it *item, w int, cur bool) string {
+	sz, st := m.sizeField(it)
 	name := fit(icon(it.name, it.dir, it.link)+" "+clean(it.name), w-sizeW-1)
 	if cur {
 		return m.cursorStyle(1).Render(sz + " " + name)
 	}
-	ns := plainStyle
-	if it.dir {
-		ns = dirStyle
-	} else if it.link {
-		ns = linkStyle
+	return st.Render(sz) + " " + nameStyle(it).Render(name)
+}
+
+// detailColumns returns the metadata columns that fit, leaving at least 20 cells for the name.
+func (m *model) detailColumns() []detailCol {
+	cols := slices.Clone(detailCols)
+	for _, drop := range detailDropOrder {
+		w := sizeW + 2 + 20
+		for _, c := range cols {
+			w += c.w + 2
+		}
+		if w <= m.contentW() {
+			break
+		}
+		cols = slices.DeleteFunc(cols, func(c detailCol) bool { return c.title == drop })
 	}
-	return st.Render(sz) + " " + ns.Render(name)
+	return cols
+}
+
+// detailsView lists one entry per row under a fixed header row.
+func (m *model) detailsView() string {
+	iw, cols := m.contentW(), m.detailColumns()
+	hdr := fmt.Sprintf("%*s", sizeW, "Size")
+	for _, c := range cols {
+		hdr += "  " + fit(c.title, c.w)
+	}
+	lines := []string{headerStyle.Render(fit(hdr+"  Name", iw))}
+	if len(m.items) == 0 {
+		lines = append(lines, dimStyle.Render("(empty)"))
+	}
+	for i := m.roff; i < len(m.items) && i < m.roff+m.innerH()-1; i++ {
+		it, x := m.items[i], m.metaOf(m.items[i])
+		sz, st := m.sizeField(it)
+		mid := ""
+		for _, c := range cols {
+			mid += "  " + fit(clean(c.val(x)), c.w)
+		}
+		name := fit(icon(it.name, it.dir, it.link)+" "+clean(it.name), max(1, iw-sizeW-ansi.StringWidth(mid)-2))
+		line := st.Render(sz) + mid + "  " + nameStyle(it).Render(name)
+		if i == m.ccur {
+			line = m.cursorStyle(1).Render(sz + mid + "  " + name)
+		}
+		lines = append(lines, ansi.Truncate(line, iw, ""))
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m *model) gridView() string {
@@ -878,16 +1209,54 @@ func dialog(color, title, body string) string {
 		Padding(1, 3).Render(lipgloss.NewStyle().Bold(true).Render(title) + "\n\n" + body)
 }
 
-func (m *model) deleteDialog() string {
-	return dialog("9", "Delete permanently?", truncLeft(clean(m.confirm), max(10, m.w-12))+"\n"+
-		dimStyle.Render(m.confirmDesc)+"\n\n"+
-		warnStyle.Render("[y]")+" Delete      "+warnStyle.Render("[n]")+" Cancel")
+func (m *model) confirmDialog() string {
+	c := m.confirm
+	return dialog("9", c.title, truncLeft(clean(c.path), max(10, m.w-12))+"\n"+
+		dimStyle.Render(c.desc)+"\n\n"+
+		warnStyle.Render("[y]")+" "+c.yes+"      "+warnStyle.Render("[n]")+" Cancel")
+}
+
+var helpKeys = [][2]string{
+	{"↑ ↓ ← →", "Move"},
+	{"PgUp PgDn", "Page up / down"},
+	{"Home End", "First / last item"},
+	{"Tab", "Switch pane"},
+	{"Enter", "Open directory / run executable"},
+	{"Esc", "Parent directory"},
+	{"g", "Go to path"},
+	{"f", "Filter by glob pattern"},
+	{"a", "Show all (clear filter)"},
+	{"s", "Cycle sort order"},
+	{"v", "Toggle grid / details view"},
+	{"r", "Refresh sizes"},
+	{"m", "Move / rename"},
+	{"c", "Copy"},
+	{"d", "Delete"},
+	{"e", "Edit in $EDITOR"},
+	{"h", "Hex dump"},
+	{"?", "This help"},
+	{"q", "Quit"},
+}
+
+func (m *model) helpDialog() string {
+	var lines []string
+	for _, k := range helpKeys {
+		lines = append(lines, warnStyle.Render(fit(k[0], 10))+"  "+fit(k[1], 32))
+	}
+	body := strings.Join(lines, "\n")
+	if half := (len(lines) + 1) / 2; m.w >= 110 { // two columns when there's room
+		body = lipgloss.JoinHorizontal(lipgloss.Top, strings.Join(lines[:half], "\n"), "    ", strings.Join(lines[half:], "\n"))
+	}
+	return dialog("12", "Commands", body+"\n\n"+dimStyle.Render("Press any key to close"))
 }
 
 func (m *model) promptDialog() string {
 	hint := "~ and relative paths work"
-	if m.prompt == "filter" {
+	switch m.prompt {
+	case "filter":
 		hint = "e.g. *.mp4 or *log*   (empty shows all)"
+	case "move", "copy":
+		hint = "Into an existing directory, or a new name. ~ and relative paths work"
 	}
 	return dialog("12", m.promptTitle, m.input.View()+"\n\n"+dimStyle.Render(hint)+"\n"+
 		warnStyle.Render("[enter]")+" OK      "+warnStyle.Render("[esc]")+" Cancel")
@@ -907,7 +1276,7 @@ func overlay(bg, fg string, w int) string {
 }
 
 func (m *model) statusBar() string {
-	keys := " tab pane  enter open  esc up  g go to  f filter  a all  s sort  r refresh  d delete  q quit"
+	keys := " ? help  enter open  esc up  f/a filter/all  s sort  v view  r refresh"
 	done, total := 0, int64(0)
 	for _, it := range m.items {
 		if it.state == sized {
@@ -941,13 +1310,19 @@ func (m model) View() string {
 	if m.filter != "" {
 		title += "   filter: " + clean(m.filter)
 	}
-	right := box(title, m.gridView(), m.w-tw, h+2, m.focus == 1)
+	body := m.gridView()
+	if m.view == detailsView {
+		body = m.detailsView()
+	}
+	right := box(title, body, m.w-tw, h+2, m.focus == 1)
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
 	switch {
-	case m.confirm != "":
-		panes = overlay(panes, m.deleteDialog(), m.w)
+	case m.confirm != nil:
+		panes = overlay(panes, m.confirmDialog(), m.w)
 	case m.prompt != "":
 		panes = overlay(panes, m.promptDialog(), m.w)
+	case m.help:
+		panes = overlay(panes, m.helpDialog(), m.w)
 	}
 	return panes + "\n" + m.statusBar()
 }

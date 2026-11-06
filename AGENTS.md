@@ -10,7 +10,7 @@ is finding what is using disk space. See README.md for features and keys.
 
 - `main.go`: the whole app (sizing workers, icons, directory tree, model, view).
 - `main_test.go`: unit tests for the pure helpers (size formatting, sort order,
-  path expansion).
+  path expansion, display sanitizing).
 
 Keep it in as few files as practical; split only when a file becomes hard to
 navigate.
@@ -40,7 +40,11 @@ tmux send-keys -t vfm q
   event (e.g. `"sss"`) and match no command.
 - Nerd Font icons are in the capture but may not display in your output;
   check line widths if alignment looks off.
-- Test destructive keys (`d`) only in a scratch directory.
+- Test destructive keys (`d`, `m`, `c`) only in a scratch directory.
+- Text typed into input dialogs: `tmux send-keys -t vfm -l 'text'`; clear the
+  pre-filled value first with `C-u`.
+- New or changed files trigger re-sizing, which (in size sorts) moves the
+  cursor back to the first item; re-select before acting on an entry.
 
 ## Conventions
 
@@ -51,6 +55,9 @@ tmux send-keys -t vfm q
   // SPDX-License-Identifier: MIT
   ```
 
+- Pass every file name or path from the filesystem through `clean()` before
+  rendering it, so names can't inject terminal escape sequences. Use the raw
+  name for filesystem operations.
 - Model state is only mutated in `Update`. Background work (sizing, deleting)
   reports back with messages; sizing results carry a generation number so
   results for a directory you've left are ignored.

@@ -7,13 +7,15 @@ The left pane is a directory tree. The right pane lists the current directory
 in a grid (like `eza --icons --grid`, but filled top-to-bottom, then
 left-to-right), with each entry's size shown next to its icon. Sizes are
 calculated in the background by several workers at once, and the list re-sorts
-as they arrive.
+as they arrive. Press `v` for a details view with permissions, owner, group,
+and modified/created times.
 
 ## Requirements
 
 - Go 1.25 or later to build.
 - A terminal using a [Nerd Font](https://www.nerdfonts.com/) for the file icons.
-- Linux or another Unix-like system (sizes come from `stat` block counts).
+- Linux (sizes come from `stat` block counts; creation times from `statx`).
+- `xxd` for the hex dump, and `$EDITOR` set for editing (falls back to `vi`).
 
 ## Install
 
@@ -34,14 +36,20 @@ options.
 | `PgUp` `PgDn`   | Move a page at a time                                      |
 | `Home` `End`    | Move to the first / last item                              |
 | `Tab`           | Switch between the tree and contents panes                 |
-| `Enter`         | Open the selected directory                                |
+| `Enter`         | Open the selected directory, or run an executable file     |
 | `Esc`           | Go up to the parent directory                              |
 | `g`             | Go to a path (`~`, relative and absolute paths work)       |
 | `f`             | Filter the contents by a glob pattern (e.g. `*.mp4`)       |
 | `a`             | Show all entries (clear the filter)                        |
 | `s`             | Cycle sort order: largest, smallest, name A→Z, name Z→A    |
+| `v`             | Switch between the grid and details views                  |
 | `r`             | Refresh sizes for the current directory                    |
+| `m`             | Move or rename the selected entry (like `mv`)              |
+| `c`             | Copy the selected entry (like `cp -R`)                     |
 | `d`             | Delete the selected file or directory (asks first)         |
+| `e`             | Edit the selected file in `$EDITOR`                        |
+| `h`             | Show a hex dump of the selected file (`xxd`)               |
+| `?`             | Show the list of commands                                  |
 | `q`             | Quit                                                       |
 
 In the tree pane, `→` expands a directory and `←` collapses it or moves to its
@@ -56,6 +64,12 @@ parent.
 - Files with several hard links are counted once per link (`du` counts them once).
 - Sizes are remembered for the session; press `r` to recalculate.
 - Delete is permanent (`rm -rf`), not a move to the trash.
+- Move and copy run the system `mv` and `cp -R`. If the destination already
+  exists, vfm asks before overwriting it.
+- Running an executable, the hex dump, and the editor take over the terminal;
+  vfm returns when they exit (the first two wait for Enter first).
+- The details view drops the Created, Group, Owner, Permissions and Modified
+  columns, in that order, when the pane is too narrow.
 - Glob patterns are case-sensitive and use Go's
   [`filepath.Match`](https://pkg.go.dev/path/filepath#Match) syntax.
 
