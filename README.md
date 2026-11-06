@@ -18,8 +18,8 @@ as they arrive.
 ## Install
 
 ```sh
-go install .        # from a checkout; installs to $(go env GOPATH)/bin/vfm
-# or
+go install github.com/vaelen/vfm@latest
+# or, from a checkout
 go build -o vfm .
 ```
 

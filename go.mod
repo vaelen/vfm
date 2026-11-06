@@ -1,4 +1,4 @@
-module vfm
+module github.com/vaelen/vfm
 
 go 1.25.1
 
