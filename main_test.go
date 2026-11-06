@@ -6,6 +6,7 @@ package main
 import (
 	"os"
 	"sort"
+	"strings"
 	"testing"
 )
 
@@ -61,5 +62,25 @@ func TestClean(t *testing.T) {
 		if got := clean(in); got != want {
 			t.Errorf("clean(%q) = %q; want %q", in, got, want)
 		}
+	}
+}
+
+func TestIsBinary(t *testing.T) {
+	long := strings.Repeat("a", 7999) + "é" // é straddles the 8000-byte sample boundary
+	for in, want := range map[string]bool{
+		"plain text\n": false, "héllo": false, long: false, "a\x00b": true, "\xff\xfe\x00": true, "bad \xff utf8": true,
+	} {
+		if got := isBinary([]byte(in)); got != want {
+			t.Errorf("isBinary(%.20q) = %v; want %v", in, got, want)
+		}
+	}
+}
+
+func TestTextHelpers(t *testing.T) {
+	if got, want := cleanText("a\r\nb\tc\x1b[31m"), "a\nb\tc?[31m"; got != want {
+		t.Errorf("cleanText = %q; want %q", got, want)
+	}
+	if got, want := expandTabs("a\tb\n\tc"), "a       b\n        c"; got != want {
+		t.Errorf("expandTabs = %q; want %q", got, want)
 	}
 }

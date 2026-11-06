@@ -5,8 +5,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -19,11 +22,14 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/glamour"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"golang.org/x/sys/unix"
@@ -331,6 +337,8 @@ type model struct {
 	roff int // details view scroll offset (rows)
 	help bool
 
+	viewer *viewer // full-screen file viewer, when open
+
 	confirm *confirmation // yes/no dialog awaiting an answer
 	busy    string        // long-running operation shown in the status bar
 
@@ -415,7 +423,7 @@ func (m *model) run(c *exec.Cmd, forget string) tea.Cmd {
 	return tea.ExecProcess(c, func(err error) tea.Msg { return execDoneMsg{err, forget} })
 }
 
-// activate handles Enter on a path: open directories (including symlinked ones), run executables.
+// activate handles Enter on a path: open directories (including symlinked ones), view files.
 func (m *model) activate(path string) tea.Cmd {
 	fi, err := os.Stat(path)
 	switch {
@@ -423,8 +431,143 @@ func (m *model) activate(path string) tea.Cmd {
 		m.err = err.Error()
 	case fi.IsDir():
 		return m.open(path, "")
-	case fi.Mode().IsRegular() && fi.Mode()&0o111 != 0:
-		return m.run(pausedCmd(m.dir, path), "")
+	case fi.Mode().IsRegular():
+		m.openViewer(path, false)
+	default:
+		m.err = "not a regular file: " + path
+	}
+	return nil
+}
+
+// confirmExec asks before running path; for a symlink the dialog shows (and runs) the real target.
+func (m *model) confirmExec(path string) {
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		m.err = err.Error()
+		return
+	}
+	if fi, err := os.Stat(real); err != nil || !fi.Mode().IsRegular() || fi.Mode()&0o111 == 0 {
+		m.err = "not an executable file: " + path
+		return
+	}
+	desc := "runs in " + m.dir
+	if real != path {
+		desc = "via symlink " + filepath.Base(path)
+	}
+	m.confirm = &confirmation{title: "Run this program?", path: real, desc: desc, yes: "Run",
+		run: m.run(pausedCmd(m.dir, real), "")}
+}
+
+// ---------- file viewer ----------
+
+const (
+	viewLimit = 4 << 20 // bytes of a file read into the viewer
+	hexLimit  = 1 << 20 // bytes shown in the hex viewer
+)
+
+var mdStyle = "dark" // glamour style; set from the terminal background before the TUI starts
+
+type viewer struct {
+	title string
+	vp    viewport.Model
+}
+
+// isBinary uses git's heuristic on the first 8 KB: a NUL byte or invalid UTF-8 means binary.
+func isBinary(data []byte) bool {
+	sample := data[:min(len(data), 8000)]
+	if bytes.IndexByte(sample, 0) >= 0 {
+		return true
+	}
+	if len(data) > len(sample) { // don't count a rune cut off by the sample boundary
+		for i := 0; i < 3 && !utf8.Valid(sample); i++ {
+			sample = sample[:len(sample)-1]
+		}
+	}
+	return !utf8.Valid(sample)
+}
+
+func expandTabs(s string) string {
+	var b strings.Builder
+	col := 0
+	for _, r := range s {
+		switch r {
+		case '\t':
+			n := 8 - col%8
+			b.WriteString(strings.Repeat(" ", n))
+			col += n
+		case '\n':
+			b.WriteRune(r)
+			col = 0
+		default:
+			b.WriteRune(r)
+			col++
+		}
+	}
+	return b.String()
+}
+
+func renderMarkdown(src string, width int) string {
+	r, err := glamour.NewTermRenderer(glamour.WithStandardStyle(mdStyle), glamour.WithWordWrap(width))
+	if err != nil {
+		return expandTabs(src)
+	}
+	out, err := r.Render(src)
+	if err != nil {
+		return expandTabs(src)
+	}
+	return out
+}
+
+// openViewer shows a file full screen: markdown rendered, other text as is, binary (or forceHex) as hex.
+// ponytail: reads up to viewLimit into memory; stream from disk if huge files need viewing.
+func (m *model) openViewer(path string, forceHex bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		m.err = err.Error()
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, viewLimit+1))
+	if err != nil {
+		m.err = err.Error()
+		return
+	}
+	truncated := len(data) > viewLimit
+	data = data[:min(len(data), viewLimit)]
+	kind, content := "text", ""
+	switch ext := strings.ToLower(filepath.Ext(path)); {
+	case forceHex || isBinary(data):
+		kind = "hex"
+		if len(data) > hexLimit {
+			data, truncated = data[:hexLimit], true
+		}
+		content = hex.Dump(data)
+	case ext == ".md" || ext == ".markdown":
+		kind, content = "markdown", renderMarkdown(cleanText(string(data)), m.w-4)
+	default:
+		content = expandTabs(cleanText(string(data)))
+	}
+	title := clean(path) + "   [" + kind + "]"
+	if truncated {
+		title += fmt.Sprintf("   (first %d MiB)", len(data)>>20)
+	}
+	vp := viewport.New(m.w-2, m.innerH())
+	vp.SetContent(content)
+	m.viewer = &viewer{title, vp}
+}
+
+func (m *model) viewerKey(msg tea.KeyMsg) tea.Cmd {
+	switch msg.String() {
+	case "q", "esc":
+		m.viewer = nil
+	case "home":
+		m.viewer.vp.GotoTop()
+	case "end":
+		m.viewer.vp.GotoBottom()
+	default:
+		var cmd tea.Cmd
+		m.viewer.vp, cmd = m.viewer.vp.Update(msg)
+		return cmd
 	}
 	return nil
 }
@@ -691,6 +834,9 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
+		if m.viewer != nil {
+			m.viewer.vp.Width, m.viewer.vp.Height = m.w-2, m.innerH()
+		}
 	case openMsg:
 		return m.open(string(msg), "")
 	case sizingMsg:
@@ -760,6 +906,9 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 		m.err = ""
 		if m.prompt != "" && msg.String() != "ctrl+c" {
 			return m.promptKey(msg)
+		}
+		if m.viewer != nil && msg.String() != "ctrl+c" {
+			return m.viewerKey(msg)
 		}
 		return m.key(msg.String())
 	}
@@ -842,11 +991,17 @@ func (m *model) key(k string) tea.Cmd {
 		return m.run(c, path)
 	case "h":
 		path := m.selected()
-		if fi, err := os.Stat(path); err != nil || fi.IsDir() {
-			m.err = "not a file: " + path
+		if fi, err := os.Stat(path); err != nil || !fi.Mode().IsRegular() {
+			m.err = "not a regular file: " + path
 			return nil
 		}
-		return m.run(pausedCmd(m.dir, "xxd", path), "")
+		m.openViewer(path, true)
+		return nil
+	case "x":
+		if path := m.selected(); path != "" {
+			m.confirmExec(path)
+		}
+		return nil
 	case "f":
 		return m.ask("filter", "Filter by glob pattern", m.filter)
 	case "a":
@@ -1021,13 +1176,23 @@ var (
 // clean replaces control characters in s with '?' so names from the filesystem can't inject
 // terminal escape sequences. Invalid UTF-8 (e.g. a raw 8-bit CSI byte) becomes U+FFFD.
 // Display only: filesystem operations keep using the raw name.
-func clean(s string) string {
+func clean(s string) string { return strings.Map(sanitize, s) }
+
+// cleanText is clean for file contents: newlines and tabs are kept, CRLF becomes LF.
+func cleanText(s string) string {
 	return strings.Map(func(r rune) rune {
-		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
-			return '?'
+		if r == '\n' || r == '\t' {
+			return r
 		}
-		return r
-	}, s)
+		return sanitize(r)
+	}, strings.ReplaceAll(s, "\r\n", "\n"))
+}
+
+func sanitize(r rune) rune {
+	if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+		return '?'
+	}
+	return r
 }
 
 // fit truncates or pads plain text to exactly w cells.
@@ -1212,7 +1377,7 @@ func dialog(color, title, body string) string {
 func (m *model) confirmDialog() string {
 	c := m.confirm
 	return dialog("9", c.title, truncLeft(clean(c.path), max(10, m.w-12))+"\n"+
-		dimStyle.Render(c.desc)+"\n\n"+
+		dimStyle.Render(ansi.Truncate(clean(c.desc), max(10, m.w-12), "…"))+"\n\n"+
 		warnStyle.Render("[y]")+" "+c.yes+"      "+warnStyle.Render("[n]")+" Cancel")
 }
 
@@ -1221,7 +1386,7 @@ var helpKeys = [][2]string{
 	{"PgUp PgDn", "Page up / down"},
 	{"Home End", "First / last item"},
 	{"Tab", "Switch pane"},
-	{"Enter", "Open directory / run executable"},
+	{"Enter", "Open directory / view file"},
 	{"Esc", "Parent directory"},
 	{"g", "Go to path"},
 	{"f", "Filter by glob pattern"},
@@ -1233,7 +1398,8 @@ var helpKeys = [][2]string{
 	{"c", "Copy"},
 	{"d", "Delete"},
 	{"e", "Edit in $EDITOR"},
-	{"h", "Hex dump"},
+	{"h", "View file as hex"},
+	{"x", "Execute (asks first)"},
 	{"?", "This help"},
 	{"q", "Quit"},
 }
@@ -1299,6 +1465,12 @@ func (m model) View() string {
 	if m.w < 40 || m.h < 6 {
 		return "Terminal too small."
 	}
+	if v := m.viewer; v != nil {
+		keys := " ↑↓ scroll  ←→ pan  pgup/pgdn page  home/end top/bottom  q/esc close"
+		pct := fmt.Sprintf("%3.0f%% ", v.vp.ScrollPercent()*100)
+		bar := barStyle.Render(fit(fit(keys, m.w-len(pct)-1)+" "+pct, m.w))
+		return box(v.title, v.vp.View(), m.w, m.innerH()+2, true) + "\n" + bar
+	}
 	h, tw := m.innerH(), m.treeW()
 	rows := m.treeRows()
 	var tl []string
@@ -1343,6 +1515,9 @@ func main() {
 	}
 	m.input.Prompt = "> "
 	m.input.Cursor.SetMode(cursor.CursorStatic) // no blink: avoids routing blink messages
+	if !lipgloss.HasDarkBackground() {
+		mdStyle = "light"
+	}
 	program = tea.NewProgram(m, tea.WithAltScreen())
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)

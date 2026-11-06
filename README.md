@@ -15,7 +15,7 @@ and modified/created times.
 - Go 1.25 or later to build.
 - A terminal using a [Nerd Font](https://www.nerdfonts.com/) for the file icons.
 - Linux (sizes come from `stat` block counts; creation times from `statx`).
-- `xxd` for the hex dump, and `$EDITOR` set for editing (falls back to `vi`).
+- `$EDITOR` set for editing (falls back to `vi`).
 
 ## Install
 
@@ -36,7 +36,7 @@ options.
 | `PgUp` `PgDn`   | Move a page at a time                                      |
 | `Home` `End`    | Move to the first / last item                              |
 | `Tab`           | Switch between the tree and contents panes                 |
-| `Enter`         | Open the selected directory, or run an executable file     |
+| `Enter`         | Open the selected directory, or view the selected file     |
 | `Esc`           | Go up to the parent directory                              |
 | `g`             | Go to a path (`~`, relative and absolute paths work)       |
 | `f`             | Filter the contents by a glob pattern (e.g. `*.mp4`)       |
@@ -48,7 +48,8 @@ options.
 | `c`             | Copy the selected entry (like `cp -R`)                     |
 | `d`             | Delete the selected file or directory (asks first)         |
 | `e`             | Edit the selected file in `$EDITOR`                        |
-| `h`             | Show a hex dump of the selected file (`xxd`)               |
+| `h`             | View the selected file as hex                              |
+| `x`             | Run the selected executable (asks first)                   |
 | `?`             | Show the list of commands                                  |
 | `q`             | Quit                                                       |
 
@@ -66,8 +67,12 @@ parent.
 - Delete is permanent (`rm -rf`), not a move to the trash.
 - Move and copy run the system `mv` and `cp -R`. If the destination already
   exists, vfm asks before overwriting it.
-- Running an executable, the hex dump, and the editor take over the terminal;
-  vfm returns when they exit (the first two wait for Enter first).
+- Enter on a file opens the built-in viewer: Markdown (`.md`, `.markdown`) is
+  rendered, other text is shown as is, and binary files are shown as hex.
+  Up to 4 MiB of a file is shown (1 MiB as hex). Press `q` or `Esc` to close.
+- `x` shows the program's real location (following symlinks) and asks before
+  running it. The program and the editor take over the terminal; after a
+  program exits, vfm waits for Enter before returning.
 - The details view drops the Created, Group, Owner, Permissions and Modified
   columns, in that order, when the pane is too narrow.
 - Glob patterns are case-sensitive and use Go's
