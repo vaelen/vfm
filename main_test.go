@@ -52,3 +52,14 @@ func TestExpandPath(t *testing.T) {
 		}
 	}
 }
+
+func TestClean(t *testing.T) {
+	for in, want := range map[string]string{
+		"ok.txt": "ok.txt", "a\x1b]0;pwned\x07b": "a?]0;pwned?b", "x\ny\tz": "x?y?z",
+		"c1\u009b31m": "c1?31m", "raw\x9b": "raw\ufffd", "héllo 日本": "héllo 日本",
+	} {
+		if got := clean(in); got != want {
+			t.Errorf("clean(%q) = %q; want %q", in, got, want)
+		}
+	}
+}

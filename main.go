@@ -305,7 +305,7 @@ const (
 func (m *model) treeW() int    { return min(40, m.w/3) }
 func (m *model) innerH() int   { return max(1, m.h-3) } // minus status bar and two borders
 func (m *model) contentW() int { return max(1, m.w-m.treeW()-2) }
-func cellWidth(it *item) int   { return sizeW + 3 + ansi.StringWidth(it.name) }
+func cellWidth(it *item) int   { return sizeW + 3 + ansi.StringWidth(clean(it.name)) }
 
 // sortItems rebuilds the visible list from all entries: filter, then sort.
 func (m *model) sortItems() {
@@ -740,6 +740,18 @@ var (
 	errBarStyle = lipgloss.NewStyle().Background(lipgloss.Color("1")).Foreground(lipgloss.Color("15"))
 )
 
+// clean replaces control characters in s with '?' so names from the filesystem can't inject
+// terminal escape sequences. Invalid UTF-8 (e.g. a raw 8-bit CSI byte) becomes U+FFFD.
+// Display only: filesystem operations keep using the raw name.
+func clean(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f || (r >= 0x80 && r <= 0x9f) {
+			return '?'
+		}
+		return r
+	}, s)
+}
+
 // fit truncates or pads plain text to exactly w cells.
 func fit(s string, w int) string {
 	s = ansi.Truncate(s, w, "…")
@@ -787,7 +799,7 @@ func (m *model) treeLine(r treeRow, cur bool, w int) string {
 	} else if n.loaded && len(n.kids) == 0 {
 		mark = "  "
 	}
-	text := fit(strings.Repeat("  ", r.depth)+mark+icon(n.name, true, false)+" "+n.name, w)
+	text := fit(strings.Repeat("  ", r.depth)+mark+icon(n.name, true, false)+" "+clean(n.name), w)
 	switch {
 	case cur:
 		return m.cursorStyle(0).Render(text)
@@ -808,7 +820,7 @@ func (m *model) itemCell(it *item, w int, cur bool) string {
 			st = warnStyle // some paths were unreadable; size is a lower bound
 		}
 	}
-	name := fit(icon(it.name, it.dir, it.link)+" "+it.name, w-sizeW-1)
+	name := fit(icon(it.name, it.dir, it.link)+" "+clean(it.name), w-sizeW-1)
 	if cur {
 		return m.cursorStyle(1).Render(sz + " " + name)
 	}
@@ -867,7 +879,7 @@ func dialog(color, title, body string) string {
 }
 
 func (m *model) deleteDialog() string {
-	return dialog("9", "Delete permanently?", truncLeft(m.confirm, max(10, m.w-12))+"\n"+
+	return dialog("9", "Delete permanently?", truncLeft(clean(m.confirm), max(10, m.w-12))+"\n"+
 		dimStyle.Render(m.confirmDesc)+"\n\n"+
 		warnStyle.Render("[y]")+" Delete      "+warnStyle.Render("[n]")+" Cancel")
 }
@@ -905,10 +917,10 @@ func (m *model) statusBar() string {
 	}
 	right, st := fmt.Sprintf("sort: %s   %d/%d sized   total %s ", sortNames[m.sortMode], done, len(m.items), strings.TrimSpace(fmtSize(total))), barStyle
 	if m.busy != "" {
-		right = m.spin.View() + " " + m.busy + " "
+		right = m.spin.View() + " " + clean(m.busy) + " "
 	}
 	if m.err != "" {
-		right, st = m.err+" ", errBarStyle
+		right, st = clean(m.err)+" ", errBarStyle
 	}
 	// Status info on the right wins; the key list is cut short if both don't fit.
 	return st.Render(fit(fit(keys, max(0, m.w-ansi.StringWidth(right)-1))+" "+right, m.w))
@@ -925,9 +937,9 @@ func (m model) View() string {
 		tl = append(tl, m.treeLine(rows[i], i == m.tcur, tw-2))
 	}
 	left := box("Directories", strings.Join(tl, "\n"), tw, h+2, m.focus == 0)
-	title := m.dir
+	title := clean(m.dir)
 	if m.filter != "" {
-		title += "   filter: " + m.filter
+		title += "   filter: " + clean(m.filter)
 	}
 	right := box(title, m.gridView(), m.w-tw, h+2, m.focus == 1)
 	panes := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
