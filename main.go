@@ -1580,7 +1580,7 @@ func (m *model) helpDialog() string {
 	if half := (len(lines) + 1) / 2; m.w >= 110 { // two columns when there's room
 		body = lipgloss.JoinHorizontal(lipgloss.Top, strings.Join(lines[:half], "\n"), "    ", strings.Join(lines[half:], "\n"))
 	}
-	title, name := "Commands", "vfm "+version()
+	title, name := "Commands", "Vaelen's File Manager "+version()
 	title += strings.Repeat(" ", max(2, lipgloss.Width(body)-len(title)-ansi.StringWidth(name))) + name
 	return dialog("12", title, body+"\n\n"+dimStyle.Render("Press any key to close"))
 }
