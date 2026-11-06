@@ -37,16 +37,17 @@ options.
 | `Home` `End`    | Move to the first / last item                              |
 | `Tab`           | Switch between the tree and contents panes                 |
 | `Enter`         | Open the selected directory, or view the selected file     |
-| `Esc`           | Go up to the parent directory                              |
+| `Esc`           | Clear the selection, or go up to the parent directory      |
+| `Space`         | Select / unselect the item under the cursor                |
 | `g`             | Go to a path (`~`, relative and absolute paths work)       |
 | `f`             | Filter the contents by a glob pattern (e.g. `*.mp4`)       |
 | `a`             | Show all entries (clear the filter)                        |
 | `s`             | Cycle sort order: by size, modified date, or name          |
 | `v`             | Switch between the grid and details views                  |
 | `r`             | Refresh sizes for the current directory                    |
-| `m`             | Move or rename the selected entry (like `mv`)              |
-| `c`             | Copy the selected entry (like `cp -R`)                     |
-| `d`             | Delete the selected file or directory (asks first)         |
+| `m`             | Move or rename the selected entries (like `mv`)            |
+| `c`             | Copy the selected entries (like `cp -R`)                   |
+| `d`             | Delete the selected entries (asks first)                   |
 | `e`             | Edit the selected file in `$EDITOR`                        |
 | `h`             | View the selected file as hex                              |
 | `x`             | Run the selected executable (asks first)                   |
@@ -67,6 +68,10 @@ parent.
 - Hidden files are shown.
 - Files with several hard links are counted once per link (`du` counts them once).
 - Sizes are remembered for the session; press `r` to recalculate.
+- Space selects several entries (shown in yellow with a `*`); `m`, `c` and `d`
+  then act on all of them, otherwise on the entry under the cursor. Opening a
+  directory or changing the filter clears the selection. Moving or copying
+  several entries needs an existing directory as the destination.
 - Delete is permanent (`rm -rf`), not a move to the trash.
 - Move and copy run the system `mv` and `cp -R`. If the destination already
   exists, vfm asks before overwriting it.

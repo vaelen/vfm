@@ -16,6 +16,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"slices"
 	"sort"
 	"strconv"
@@ -204,6 +205,7 @@ type item struct {
 	size      int64
 	partial   bool
 	mtime     time.Time // modification time (of the link itself, for symlinks)
+	marked    bool      // selected with space; cleared by opening a directory or changing the filter
 	meta      *meta     // loaded lazily by metaOf for the details view
 }
 
@@ -363,8 +365,9 @@ type model struct {
 	confirm *confirmation // yes/no dialog awaiting an answer
 	busy    string        // long-running operation shown in the status bar
 
-	prompt, promptTitle, promptSrc string // open input dialog kind, its title, and the path it acts on
-	input                          textinput.Model
+	prompt, promptTitle string   // open input dialog kind and its title
+	promptSrcs          []string // paths the dialog acts on (move/copy)
+	input               textinput.Model
 
 	spin spinner.Model
 	err  string
@@ -382,16 +385,16 @@ type confirmation struct {
 }
 
 type deletedMsg struct {
-	path string
-	err  error
+	paths []string
+	err   error // the first failure, if any
 }
 
-// opDoneMsg reports a finished mv/cp of src to dst (the final path).
+// opDoneMsg reports a finished mv/cp of srcs; dsts are the final paths, in the same order.
 type opDoneMsg struct {
-	src, dst string
-	move     bool
-	out      string
-	err      error
+	srcs, dsts []string
+	move       bool
+	out        string
+	err        error
 }
 
 // execDoneMsg reports return from a suspended external program; forget is a path whose size may have changed.
@@ -595,35 +598,98 @@ func (m *model) viewerKey(msg tea.KeyMsg) tea.Cmd {
 	return nil
 }
 
-// transfer runs mv or cp -R from src to the user's destination, confirming before overwriting.
-func (m *model) transfer(kind, src, v string) tea.Cmd {
-	if v == "" {
+// transfer runs mv or cp -R from srcs to the user's destination, confirming before overwriting.
+// Like mv and cp, several sources need an existing directory as the destination.
+func (m *model) transfer(kind string, srcs []string, v string) tea.Cmd {
+	if v == "" || len(srcs) == 0 {
 		return nil
 	}
 	dst := expandPath(v, m.dir)
-	target := dst // the path src will end up at
-	if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
-		target = filepath.Join(dst, filepath.Base(src))
-	}
-	if target == src {
-		m.err = "source and destination are the same"
+	fi, err := os.Stat(dst)
+	isDir := err == nil && fi.IsDir()
+	if len(srcs) > 1 && !isDir {
+		m.err = "destination must be an existing directory: " + dst
 		return nil
 	}
-	name, args, verb := "mv", []string{"--", src, dst}, "Moving"
-	if kind == "copy" {
-		name, args, verb = "cp", []string{"-R", "--", src, dst}, "Copying"
+	var targets, existing []string // where each src will end up; which of those already exist
+	for _, src := range srcs {
+		t := dst
+		if isDir {
+			t = filepath.Join(dst, filepath.Base(src))
+		}
+		if t == src {
+			m.err = "source and destination are the same: " + src
+			return nil
+		}
+		targets = append(targets, t)
+		if _, err := os.Lstat(t); err == nil {
+			existing = append(existing, t)
+		}
 	}
+	name, args, verb := "mv", []string{"--"}, "Moving"
+	if kind == "copy" {
+		name, args, verb = "cp", []string{"-R", "--"}, "Copying"
+	}
+	args = append(append(args, srcs...), dst)
 	run := func() tea.Msg {
 		out, err := exec.Command(name, args...).CombinedOutput()
-		return opDoneMsg{src, target, kind == "move", string(out), err}
+		return opDoneMsg{srcs, targets, kind == "move", string(out), err}
 	}
-	busy := verb + " " + src + "…"
-	if _, err := os.Lstat(target); err == nil {
-		m.confirm = &confirmation{title: "Overwrite?", path: target, desc: "already exists", yes: "Overwrite", busy: busy, run: run}
+	busy := verb + " " + describe(srcs) + "…"
+	if len(existing) > 0 {
+		desc := "already exists"
+		if len(existing) > 1 {
+			desc = fmt.Sprintf("and %d more already exist", len(existing)-1)
+		}
+		m.confirm = &confirmation{title: "Overwrite?", path: existing[0], desc: desc, yes: "Overwrite", busy: busy, run: run}
 		return nil
 	}
 	m.busy = busy
 	return run
+}
+
+// describe names a list of paths for messages: the path itself if there's one, else a count.
+func describe(paths []string) string {
+	if len(paths) == 1 {
+		return paths[0]
+	}
+	return fmt.Sprintf("%d items", len(paths))
+}
+
+// targets returns the paths an operation acts on: the marked items in the contents pane if
+// there are any, otherwise the entry under the cursor.
+func (m *model) targets() []string {
+	var paths []string
+	if m.focus == 1 {
+		for _, it := range m.items {
+			if it.marked {
+				paths = append(paths, filepath.Join(m.dir, it.name))
+			}
+		}
+	}
+	if len(paths) == 0 {
+		if p := m.selected(); p != "" {
+			paths = []string{p}
+		}
+	}
+	return paths
+}
+
+// marks returns how many items are marked and the total of their known sizes.
+func (m *model) marks() (n int, size int64) {
+	for _, it := range m.items {
+		if it.marked {
+			n++
+			size += it.size
+		}
+	}
+	return n, size
+}
+
+func (m *model) clearMarks() {
+	for _, it := range m.all {
+		it.marked = false
+	}
 }
 
 // forget drops cached sizes for path, everything under it, and its ancestors (whose totals include it).
@@ -788,7 +854,7 @@ func (m *model) resort() {
 
 // ask opens an input dialog of the given kind.
 func (m *model) ask(kind, title, value string) tea.Cmd {
-	m.prompt, m.promptTitle, m.promptSrc = kind, title, m.selected()
+	m.prompt, m.promptTitle, m.promptSrcs = kind, title, m.targets()
 	m.input.Width = max(10, min(60, m.w-16))
 	m.input.SetValue(value)
 	m.input.CursorEnd()
@@ -818,6 +884,7 @@ func (m *model) submit(kind, v string) tea.Cmd {
 			return nil
 		}
 		m.filter = v
+		m.clearMarks()
 		m.resort()
 	case "goto":
 		if v == "" {
@@ -834,7 +901,7 @@ func (m *model) submit(kind, v string) tea.Cmd {
 		}
 		return m.open(p, "")
 	case "move", "copy":
-		return m.transfer(kind, m.promptSrc, v)
+		return m.transfer(kind, m.promptSrcs, v)
 	case "shell":
 		if v == "" {
 			return nil
@@ -904,13 +971,18 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 		m.busy = ""
 		if msg.err != nil {
 			m.err = msg.err.Error()
-		} else if n := m.walkTo(msg.path, false); n.path == msg.path && n.parent != nil {
-			n.parent.kids = slices.DeleteFunc(n.parent.kids, func(k *node) bool { return k == n })
 		}
-		m.forget(msg.path)
 		dir := m.dir
-		if under(dir, msg.path) {
-			dir = filepath.Dir(msg.path)
+		for _, p := range msg.paths {
+			if _, err := os.Lstat(p); os.IsNotExist(err) {
+				if n := m.walkTo(p, false); n.path == p && n.parent != nil {
+					n.parent.kids = slices.DeleteFunc(n.parent.kids, func(k *node) bool { return k == n })
+				}
+			}
+			m.forget(p)
+			if under(dir, p) {
+				dir = filepath.Dir(p)
+			}
 		}
 		return m.reopen(dir)
 	case opDoneMsg:
@@ -921,15 +993,17 @@ func (m *model) update(msg tea.Msg) tea.Cmd {
 			}
 		}
 		dir := m.dir
-		if msg.move {
-			m.forget(msg.src)
-			m.reloadNode(filepath.Dir(msg.src))
-			if under(dir, msg.src) {
-				dir = filepath.Dir(msg.src)
+		for i, src := range msg.srcs {
+			if msg.move {
+				m.forget(src)
+				m.reloadNode(filepath.Dir(src))
+				if under(dir, src) {
+					dir = filepath.Dir(src)
+				}
 			}
+			m.forget(msg.dsts[i])
+			m.reloadNode(filepath.Dir(msg.dsts[i]))
 		}
-		m.forget(msg.dst)
-		m.reloadNode(filepath.Dir(msg.dst))
 		return m.reopen(dir)
 	case execDoneMsg:
 		if msg.err != nil {
@@ -983,38 +1057,60 @@ func (m *model) key(k string) tea.Cmd {
 		m.reloadNode(m.dir)
 		return m.reopen(m.dir)
 	case "d":
-		path := m.selected()
-		if path == "" || path == "/" || m.busy != "" {
+		paths := m.targets()
+		if len(paths) == 0 || slices.Contains(paths, "/") || m.busy != "" {
 			return nil
 		}
-		fi, err := os.Lstat(path)
-		if err != nil {
-			m.err = err.Error()
-			return nil
+		title, path, desc := "Delete permanently?", paths[0], ""
+		if len(paths) == 1 {
+			fi, err := os.Lstat(path)
+			if err != nil {
+				m.err = err.Error()
+				return nil
+			}
+			desc = "file"
+			if fi.IsDir() {
+				desc = "directory and everything in it"
+			}
+			if r, ok := m.cache[path]; ok {
+				desc += ", " + strings.TrimSpace(fmtSize(r.size))
+			}
+		} else {
+			_, size := m.marks()
+			names := make([]string, len(paths))
+			for i, p := range paths {
+				names[i] = filepath.Base(p)
+			}
+			title = fmt.Sprintf("Delete %d items permanently?", len(paths))
+			path, desc = m.dir, strings.TrimSpace(fmtSize(size))+": "+strings.Join(names, ", ")
 		}
-		desc := "file"
-		if fi.IsDir() {
-			desc = "directory and everything in it"
-		}
-		if r, ok := m.cache[path]; ok {
-			desc += ", " + strings.TrimSpace(fmtSize(r.size))
-		}
-		m.confirm = &confirmation{title: "Delete permanently?", path: path, desc: desc, yes: "Delete",
-			busy: "Deleting " + path + "…", run: func() tea.Msg { return deletedMsg{path, os.RemoveAll(path)} }}
+		m.confirm = &confirmation{title: title, path: path, desc: desc, yes: "Delete",
+			busy: "Deleting " + describe(paths) + "…", run: func() tea.Msg {
+				var first error
+				for _, p := range paths {
+					if err := os.RemoveAll(p); err != nil && first == nil {
+						first = err
+					}
+				}
+				return deletedMsg{paths, first}
+			}}
 		return nil
 	case "m", "c":
-		path := m.selected()
-		if path == "" || path == "/" || m.busy != "" {
+		paths := m.targets()
+		if len(paths) == 0 || slices.Contains(paths, "/") || m.busy != "" {
 			return nil
 		}
-		name := filepath.Base(path)
-		if clean(name) != name {
-			name = "" // don't echo control characters into the input
+		value, what := "", fmt.Sprintf("%d items", len(paths))
+		if len(paths) == 1 {
+			value, what = filepath.Base(paths[0]), ""
+			if clean(value) != value {
+				value = "" // don't echo control characters into the input
+			}
 		}
 		if k == "m" {
-			return m.ask("move", "Move / rename to", name)
+			return m.ask("move", strings.TrimSpace("Move / rename "+what+" to"), value)
 		}
-		return m.ask("copy", "Copy to", name)
+		return m.ask("copy", strings.TrimSpace("Copy "+what+" to"), value)
 	case "e":
 		path := m.selected()
 		if path == "" {
@@ -1046,6 +1142,7 @@ func (m *model) key(k string) tea.Cmd {
 		return m.ask("filter", "Filter by glob pattern", m.filter)
 	case "a":
 		m.filter = ""
+		m.clearMarks()
 		m.resort()
 		return nil
 	case "g":
@@ -1058,6 +1155,10 @@ func (m *model) key(k string) tea.Cmd {
 		m.focus ^= 1
 		return nil
 	case "esc":
+		if n, _ := m.marks(); n > 0 {
+			m.clearMarks()
+			return nil
+		}
 		if parent := filepath.Dir(m.dir); parent != m.dir {
 			return m.open(parent, filepath.Base(m.dir))
 		}
@@ -1127,6 +1228,11 @@ func (m *model) contentKey(k string) tea.Cmd {
 		m.ccur = 0
 	case "end":
 		m.ccur = n - 1
+	case " ":
+		if m.ccur < n {
+			m.items[m.ccur].marked = !m.items[m.ccur].marked
+			m.ccur = min(n-1, m.ccur+1)
+		}
 	case "left":
 		if m.view == gridView && m.ccur >= rows {
 			m.ccur -= rows
@@ -1211,6 +1317,7 @@ var (
 	barStyle    = lipgloss.NewStyle().Reverse(true)
 	errBarStyle = lipgloss.NewStyle().Background(lipgloss.Color("1")).Foreground(lipgloss.Color("15"))
 	headerStyle = lipgloss.NewStyle().Bold(true).Underline(true)
+	markStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 )
 
 // clean replaces control characters in s with '?' so names from the filesystem can't inject
@@ -1316,11 +1423,24 @@ func nameStyle(it *item) lipgloss.Style {
 	return plainStyle
 }
 
+// markChar is shown between the size and icon of marked items.
+func markChar(it *item) string {
+	if it.marked {
+		return "*"
+	}
+	return " "
+}
+
 func (m *model) itemCell(it *item, w int, cur bool) string {
 	sz, st := m.sizeField(it)
 	name := fit(icon(it.name, it.dir, it.link)+" "+clean(it.name), w-sizeW-1)
-	if cur {
+	switch {
+	case cur && it.marked:
+		return m.cursorStyle(1).Inherit(markStyle).Render(sz + "*" + name)
+	case cur:
 		return m.cursorStyle(1).Render(sz + " " + name)
+	case it.marked:
+		return markStyle.Render(sz + "*" + name)
 	}
 	return st.Render(sz) + " " + nameStyle(it).Render(name)
 }
@@ -1361,8 +1481,13 @@ func (m *model) detailsView() string {
 		}
 		name := fit(icon(it.name, it.dir, it.link)+" "+clean(it.name), max(1, iw-sizeW-ansi.StringWidth(mid)-2))
 		line := st.Render(sz) + mid + "  " + nameStyle(it).Render(name)
-		if i == m.ccur {
-			line = m.cursorStyle(1).Render(sz + mid + "  " + name)
+		switch plain := sz + mid + " " + markChar(it) + name; {
+		case i == m.ccur && it.marked:
+			line = m.cursorStyle(1).Inherit(markStyle).Render(plain)
+		case i == m.ccur:
+			line = m.cursorStyle(1).Render(plain)
+		case it.marked:
+			line = markStyle.Render(plain)
 		}
 		lines = append(lines, ansi.Truncate(line, iw, ""))
 	}
@@ -1427,7 +1552,8 @@ var helpKeys = [][2]string{
 	{"Home End", "First / last item"},
 	{"Tab", "Switch pane"},
 	{"Enter", "Open directory / view file"},
-	{"Esc", "Parent directory"},
+	{"Esc", "Clear selection / parent directory"},
+	{"Space", "Select / unselect item"},
 	{"g", "Go to path"},
 	{"f", "Filter by glob pattern"},
 	{"a", "Show all (clear filter)"},
@@ -1454,7 +1580,9 @@ func (m *model) helpDialog() string {
 	if half := (len(lines) + 1) / 2; m.w >= 110 { // two columns when there's room
 		body = lipgloss.JoinHorizontal(lipgloss.Top, strings.Join(lines[:half], "\n"), "    ", strings.Join(lines[half:], "\n"))
 	}
-	return dialog("12", "Commands", body+"\n\n"+dimStyle.Render("Press any key to close"))
+	title, name := "Commands", "vfm "+version()
+	title += strings.Repeat(" ", max(2, lipgloss.Width(body)-len(title)-ansi.StringWidth(name))) + name
+	return dialog("12", title, body+"\n\n"+dimStyle.Render("Press any key to close"))
 }
 
 func (m *model) promptDialog() string {
@@ -1469,6 +1597,15 @@ func (m *model) promptDialog() string {
 	}
 	return dialog("12", m.promptTitle, m.input.View()+"\n\n"+dimStyle.Render(hint)+"\n"+
 		warnStyle.Render("[enter]")+" OK      "+warnStyle.Render("[esc]")+" Cancel")
+}
+
+// version is the module version Go stamped into the binary: the release tag for go install
+// and tagged builds, otherwise a pseudo-version of the commit (with +dirty for local changes).
+func version() string {
+	if bi, ok := debug.ReadBuildInfo(); ok && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return "dev"
 }
 
 // overlay draws fg centered on top of bg (both w cells wide).
@@ -1499,6 +1636,9 @@ func (m *model) statusBar() string {
 	}
 	right, st := fmt.Sprintf("sort: %s   %d/%d sized   total %s%s ", sortNames[m.sortMode], done, len(m.items),
 		strings.TrimSpace(fmtSize(total)), free), barStyle
+	if n, size := m.marks(); n > 0 {
+		right = fmt.Sprintf("%d selected (%s)   ", n, strings.TrimSpace(fmtSize(size))) + right
+	}
 	if m.busy != "" {
 		right = m.spin.View() + " " + clean(m.busy) + " "
 	}
